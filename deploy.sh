@@ -96,6 +96,24 @@ collect_parameters() {
     read -p "Enter application internal port [3000]: " APP_PORT
     APP_PORT=${APP_PORT:-3000}
     
+    # Domain name (optional for SSL)
+    read -p "Enter domain name (optional, leave empty for IP-only access): " DOMAIN_NAME
+    
+    # SSL Configuration
+    ENABLE_SSL="no"
+    if [[ -n "$DOMAIN_NAME" ]]; then
+        read -p "Enable SSL/HTTPS with Let's Encrypt? (yes/no) [yes]: " ENABLE_SSL
+        ENABLE_SSL=${ENABLE_SSL:-yes}
+        
+        if [[ "$ENABLE_SSL" == "yes" ]]; then
+            read -p "Enter email for SSL certificate notifications: " SSL_EMAIL
+            if [[ -z "$SSL_EMAIL" ]]; then
+                log_error "Email is required for SSL certificates"
+                exit 1
+            fi
+        fi
+    fi
+    
     # App name (derived from repo)
     APP_NAME=$(basename "$GIT_REPO" .git)
     
@@ -105,6 +123,10 @@ collect_parameters() {
     log "Server: $SSH_USER@$SERVER_IP"
     log "App Port: $APP_PORT"
     log "App Name: $APP_NAME"
+    if [[ -n "$DOMAIN_NAME" ]]; then
+        log "Domain: $DOMAIN_NAME"
+        log "SSL Enabled: $ENABLE_SSL"
+    fi
 }
 
 ################################################################################
@@ -215,6 +237,14 @@ prepare_remote_environment() {
             echo "Nginx already installed"
         fi
         
+        # Install Certbot if not present (for SSL)
+        if ! command -v certbot &> /dev/null; then
+            echo "Installing Certbot..."
+            sudo apt-get install -y certbot python3-certbot-nginx
+        else
+            echo "Certbot already installed"
+        fi
+        
         # Add user to docker group
         sudo usermod -aG docker $USER || true
         
@@ -222,6 +252,7 @@ prepare_remote_environment() {
         docker --version
         docker-compose --version
         nginx -v
+        certbot --version
         
         echo "Remote environment ready"
 ENDSSH
@@ -315,6 +346,13 @@ configure_nginx() {
     
     NGINX_CONFIG="/etc/nginx/sites-available/$APP_NAME"
     
+    # Determine server_name based on domain or IP
+    if [[ -n "$DOMAIN_NAME" ]]; then
+        SERVER_NAME="$DOMAIN_NAME"
+    else
+        SERVER_NAME="_"
+    fi
+    
     if ! ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" bash << ENDSSH 2>&1 | tee -a "$LOG_FILE"
         set -e
         
@@ -322,7 +360,7 @@ configure_nginx() {
         sudo tee $NGINX_CONFIG > /dev/null << 'NGINX_EOF'
 server {
     listen 80;
-    server_name _;
+    server_name $SERVER_NAME;
     
     location / {
         proxy_pass http://localhost:$APP_PORT;
@@ -358,6 +396,54 @@ ENDSSH
     fi
     
     log "✓ Nginx configured successfully"
+}
+
+################################################################################
+# Task 7b: Configure SSL with Let's Encrypt
+################################################################################
+
+configure_ssl() {
+    if [[ "$ENABLE_SSL" != "yes" ]] || [[ -z "$DOMAIN_NAME" ]]; then
+        log "Skipping SSL configuration (not enabled or no domain provided)"
+        return 0
+    fi
+    
+    log "=== Task 7b: Configuring SSL with Let's Encrypt ==="
+    
+    log_warn "IMPORTANT: Make sure $DOMAIN_NAME points to $SERVER_IP before continuing"
+    read -p "Press Enter to continue with SSL setup, or Ctrl+C to cancel..."
+    
+    if ! ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" bash << ENDSSH 2>&1 | tee -a "$LOG_FILE"
+        set -e
+        
+        echo "Obtaining SSL certificate from Let's Encrypt..."
+        
+        # Run certbot in non-interactive mode
+        sudo certbot --nginx \
+            -d $DOMAIN_NAME \
+            --non-interactive \
+            --agree-tos \
+            --email $SSL_EMAIL \
+            --redirect
+        
+        echo "SSL certificate obtained and configured successfully"
+        
+        # Test Nginx configuration
+        sudo nginx -t
+        
+        # Setup auto-renewal (certbot usually does this automatically)
+        sudo systemctl enable certbot.timer || true
+        
+        echo "SSL configuration complete"
+ENDSSH
+    then
+        log_error "Failed to configure SSL"
+        log_warn "You can manually run: sudo certbot --nginx -d $DOMAIN_NAME"
+        exit 1
+    fi
+    
+    log "✓ SSL configured successfully"
+    log "✓ Auto-renewal enabled"
 }
 
 ################################################################################
@@ -420,7 +506,16 @@ ENDSSH
     log ""
     log "=========================================="
     log "Deployment completed successfully!"
-    log "Access your application at: http://$SERVER_IP"
+    
+    if [[ "$ENABLE_SSL" == "yes" ]] && [[ -n "$DOMAIN_NAME" ]]; then
+        log "Access your application at: https://$DOMAIN_NAME"
+        log "HTTP traffic will automatically redirect to HTTPS"
+    elif [[ -n "$DOMAIN_NAME" ]]; then
+        log "Access your application at: http://$DOMAIN_NAME"
+    else
+        log "Access your application at: http://$SERVER_IP"
+    fi
+    
     log "=========================================="
 }
 
@@ -478,6 +573,7 @@ main() {
     prepare_remote_environment
     deploy_application
     configure_nginx
+    configure_ssl  # New SSL configuration step
     validate_deployment
     
     log "All tasks completed successfully!"
