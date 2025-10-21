@@ -6,6 +6,7 @@
 ################################################################################
 
 set -e  # Exit on any error
+set -o pipefail  # Exit if any command in a pipeline fails
 
 # Color codes for output
 RED='\033[0;31m'
@@ -119,10 +120,16 @@ clone_repository() {
     if [[ -d "$APP_NAME" ]]; then
         log_warn "Directory $APP_NAME already exists, pulling latest changes"
         cd "$APP_NAME"
-        git pull origin "$GIT_BRANCH" 2>&1 | tee -a "$LOG_FILE"
+        if ! git pull origin "$GIT_BRANCH" 2>&1 | tee -a "$LOG_FILE"; then
+            log_error "Failed to pull latest changes from repository"
+            exit 1
+        fi
     else
         log "Cloning repository..."
-        git clone -b "$GIT_BRANCH" "$AUTH_REPO" "$APP_NAME" 2>&1 | tee -a "$LOG_FILE"
+        if ! git clone -b "$GIT_BRANCH" "$AUTH_REPO" "$APP_NAME" 2>&1 | tee -a "$LOG_FILE"; then
+            log_error "Failed to clone repository"
+            exit 1
+        fi
         cd "$APP_NAME"
     fi
     
@@ -158,12 +165,13 @@ verify_project() {
 check_ssh_connection() {
     log "=== Task 4: Testing SSH Connection ==="
     
-    if ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$SSH_USER@$SERVER_IP" "echo 'SSH connection successful'" 2>&1 | tee -a "$LOG_FILE"; then
-        log "✓ SSH connection established"
-    else
+    if ! ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 "$SSH_USER@$SERVER_IP" "echo 'SSH connection successful'" 2>&1 | tee -a "$LOG_FILE"; then
         log_error "Cannot connect to $SSH_USER@$SERVER_IP"
+        log_error "Please check: 1) Server is running 2) SSH key is correct 3) Firewall allows SSH"
         exit 1
     fi
+    
+    log "✓ SSH connection established"
 }
 
 ################################################################################
@@ -173,7 +181,7 @@ check_ssh_connection() {
 prepare_remote_environment() {
     log "=== Task 5: Preparing Remote Environment ==="
     
-    ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" bash << 'ENDSSH' 2>&1 | tee -a "$LOG_FILE"
+    if ! ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" bash << 'ENDSSH' 2>&1 | tee -a "$LOG_FILE"
         set -e
         
         echo "Updating system packages..."
@@ -185,12 +193,16 @@ prepare_remote_environment() {
             sudo apt-get install -y docker.io
             sudo systemctl enable docker
             sudo systemctl start docker
+        else
+            echo "Docker already installed"
         fi
         
         # Install Docker Compose if not present
         if ! command -v docker-compose &> /dev/null; then
             echo "Installing Docker Compose..."
             sudo apt-get install -y docker-compose
+        else
+            echo "Docker Compose already installed"
         fi
         
         # Install Nginx if not present
@@ -199,6 +211,8 @@ prepare_remote_environment() {
             sudo apt-get install -y nginx
             sudo systemctl enable nginx
             sudo systemctl start nginx
+        else
+            echo "Nginx already installed"
         fi
         
         # Add user to docker group
@@ -211,6 +225,10 @@ prepare_remote_environment() {
         
         echo "Remote environment ready"
 ENDSSH
+    then
+        log_error "Failed to prepare remote environment"
+        exit 1
+    fi
     
     log "✓ Remote environment prepared"
 }
@@ -226,8 +244,15 @@ deploy_application() {
     
     # Transfer files to remote server
     log "Transferring files to remote server..."
-    ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" "mkdir -p $REMOTE_DIR" 2>&1 | tee -a "$LOG_FILE"
-    rsync -avz -e "ssh -i $SSH_KEY" --exclude='.git' "$PROJECT_DIR/" "$SSH_USER@$SERVER_IP:$REMOTE_DIR/" 2>&1 | tee -a "$LOG_FILE"
+    if ! ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" "mkdir -p $REMOTE_DIR" 2>&1 | tee -a "$LOG_FILE"; then
+        log_error "Failed to create remote directory"
+        exit 1
+    fi
+    
+    if ! rsync -avz -e "ssh -i $SSH_KEY" --exclude='.git' "$PROJECT_DIR/" "$SSH_USER@$SERVER_IP:$REMOTE_DIR/" 2>&1 | tee -a "$LOG_FILE"; then
+        log_error "Failed to transfer files to remote server"
+        exit 1
+    fi
     
     log "Files transferred successfully"
     
@@ -235,7 +260,7 @@ deploy_application() {
     log "Building and running Docker container..."
     
     if [[ "$DEPLOY_TYPE" == "compose" ]]; then
-        ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" bash << ENDSSH 2>&1 | tee -a "$LOG_FILE"
+        if ! ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" bash << ENDSSH 2>&1 | tee -a "$LOG_FILE"
             set -e
             cd $REMOTE_DIR
             
@@ -249,8 +274,12 @@ deploy_application() {
             sleep 5
             docker-compose ps
 ENDSSH
+        then
+            log_error "Failed to deploy application using docker-compose"
+            exit 1
+        fi
     else
-        ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" bash << ENDSSH 2>&1 | tee -a "$LOG_FILE"
+        if ! ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" bash << ENDSSH 2>&1 | tee -a "$LOG_FILE"
             set -e
             cd $REMOTE_DIR
             
@@ -268,6 +297,10 @@ ENDSSH
             sleep 5
             docker ps | grep $APP_NAME
 ENDSSH
+        then
+            log_error "Failed to deploy application using Docker"
+            exit 1
+        fi
     fi
     
     log "✓ Application deployed successfully"
@@ -282,7 +315,7 @@ configure_nginx() {
     
     NGINX_CONFIG="/etc/nginx/sites-available/$APP_NAME"
     
-    ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" bash << ENDSSH 2>&1 | tee -a "$LOG_FILE"
+    if ! ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" bash << ENDSSH 2>&1 | tee -a "$LOG_FILE"
         set -e
         
         # Create Nginx configuration
@@ -319,6 +352,10 @@ NGINX_EOF
         
         echo "Nginx configured successfully"
 ENDSSH
+    then
+        log_error "Failed to configure Nginx"
+        exit 1
+    fi
     
     log "✓ Nginx configured successfully"
 }
@@ -330,7 +367,7 @@ ENDSSH
 validate_deployment() {
     log "=== Task 8: Validating Deployment ==="
     
-    ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" bash << ENDSSH 2>&1 | tee -a "$LOG_FILE"
+    if ! ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" bash << ENDSSH 2>&1 | tee -a "$LOG_FILE"
         set -e
         
         # Check Docker service
@@ -346,6 +383,7 @@ validate_deployment() {
             echo "✓ Container $APP_NAME is running"
         else
             echo "✗ Container $APP_NAME is not running"
+            docker ps -a | grep $APP_NAME || true
             exit 1
         fi
         
@@ -362,15 +400,21 @@ validate_deployment() {
         if curl -f -s http://localhost:$APP_PORT > /dev/null; then
             echo "✓ Application is responding on port $APP_PORT"
         else
-            echo "⚠ Application may not be fully ready yet"
+            echo "✗ Application is not responding on port $APP_PORT"
+            exit 1
         fi
         
         if curl -f -s http://localhost > /dev/null; then
             echo "✓ Nginx proxy is working"
         else
-            echo "⚠ Nginx proxy may not be fully configured"
+            echo "✗ Nginx proxy is not working"
+            exit 1
         fi
 ENDSSH
+    then
+        log_error "Deployment validation failed"
+        exit 1
+    fi
     
     log "✓ Deployment validated"
     log ""
